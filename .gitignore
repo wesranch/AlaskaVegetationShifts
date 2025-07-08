@@ -1,2 +1,8 @@
 data/*
-!.gitkeep
+!data/.gitkeep
+
+models/*
+!models/.gitkeep
+
+results/*
+!results/.gitkeep
