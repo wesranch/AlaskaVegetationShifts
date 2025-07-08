@@ -27,6 +27,7 @@ models <- setNames(
 #path to tiles in dev env
 files <- list.files("F:/remoteSensing/data/output/gee/tiles/", pattern = "landis-tile-", full.names = TRUE)
 #files <- list.files("data/processed/raster/tiles/", full.names = TRUE)
+files <- files[!grepl("0000011264-0000000000", files)] #rm empty rasters that earth engine created
 ```
 
 Function to add lat/lon as raster bands and remove/modify existing bands
@@ -76,13 +77,6 @@ for (spp in names(models)){
   #loop over each raster file (mosaic later)
   for (i in seq_along(files)){
     file <- files[[i]]
-    filename <- basename(file)
-    
-    #skip tiles that are outside aoi
-    if (grepl("0000011264-0000000000.tif", filename)) {
-      message("Skipping file: ", filename)
-      next
-    }
     
     #one raster layer for spatial reference
     r <- add_xy_bands(file)
