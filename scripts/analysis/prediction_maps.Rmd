@@ -76,6 +76,13 @@ for (spp in names(models)){
   #loop over each raster file (mosaic later)
   for (i in seq_along(files)){
     file <- files[[i]]
+    filename <- basename(file)
+    
+    #skip tiles that are outside aoi
+    if (grepl("0000011264-0000000000.tif", filename)) {
+      message("Skipping file: ", filename)
+      next
+    }
     
     #one raster layer for spatial reference
     r <- add_xy_bands(file)
@@ -90,7 +97,7 @@ for (spp in names(models)){
     path <- "data/processed/raster/tiles/"
     pattern <- tools::toTitleCase(strsplit(spp, "_")[[1]][3] %>% 
                                     paste0(strsplit(spp, "_")[[1]][4]))
-    writeRaster(prediction_raster, paste0(path, "prediction_tile_", pattern, "_", i, ".tif"))
+    writeRaster(prediction_raster, paste0(path, "prediction_tile_", pattern, "_", i, ".tif"), overwrite=TRUE)
     print(paste0("file written: ", basename(file)))
   }
 }
