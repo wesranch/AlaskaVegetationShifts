@@ -1,0 +1,324 @@
+---
+title: "Random Forest Modeling"
+author: "Wesley Rancher"
+date: "2024-08-13"
+output: html_document
+editor_options:
+    chunk_output_type: console
+---
+
+## The code takes outputs from Google Earth Engine in the form of annual Landsat derived predictor variable raster stacks. Accompanied with csvs of pv pixel values at fia plots. This data is used to run and combine(?) random forest models and make spatial predictions of species and functional group biomass and basal area.
+
+```{r}
+knitr::opts_chunk$set(echo = FALSE, eval = FALSE, fig.width = 6, fig.align = 'center')
+library(dplyr)
+library(terra)
+library(Boruta)
+library(randomForest)
+library(stringr)
+#library(Hmisc)
+#library(corrplot)
+library(tidyr)
+library(sf)
+```
+
+```{r Read in reponse variable dataframes}
+knitr::opts_chunk$set(echo = TRUE, eval = FALSE, fig.width = 6, fig.align = 'center')
+# read in plots // this csv from Biomass_BA_calculations.Rmd was clipped to our Boreal Region
+# shapefile in ArcPro 
+fia_plots <- read.csv("data/output/csv/cleaned/ak_fia_plots_2016_clipped.csv")
+
+# read in basal area and biomass
+reclass_ba <- read.csv("data/output/csv/cleaned/reclass_ba.csv")
+spp_ba <- read.csv("data/output/csv/cleaned/spp_ba.csv") #updated to include ALL spp
+reclass_biomass <- read.csv("data/output/csv/cleaned/reclass_biomass_allSpp.csv") #allSPP is the updated
+spp_biomass <- read.csv("data/output/csv/cleaned/sppBiomass_allSpp.csv")
+
+#join basal area to plots (spp. sum in a plot) BA = m2 and Bio = g/m2
+spp_ba_plots <- left_join(fia_plots, spp_ba, by = "PLOT") #join where we have BA calculations
+reclass_ba_plots <- left_join(fia_plots, reclass_ba, by = "PLOT")
+reclass_biomass_plots <- left_join(fia_plots, reclass_biomass, by = "PLOT")
+spp_biomass_plots <- left_join(fia_plots, spp_biomass, by = "PLOT")
+reclass_ba_plots$Decid_Frac <- reclass_ba_plots$BA_Hardwood / 
+                      (reclass_ba_plots$BA_Hardwood + reclass_ba_plots$BA_Conifer)
+```
+
+```{r}
+# we want to read in the landis model region and join plots to this (crop)
+landis_full <- st_read("E:/MS-Research/alaska/modelling/Gabe_files/FullLandscape_Extent/FullLandscapeV3_082722.shp")
+#for now we crop by ext but we want to join by plot
+fia_plots_sf <- st_as_sf(fia_plots, coords = ("LON", "LAT"))
+landis_plots <- left_join(landis_full, spp_biomass_plots, by = "PLOT")
+```
+
+## Here, you will need annual csv's of predictor variables output from GEE (2000-2023). Currently not iterating but will be useful when all csv's are downloaded and look correct.
+
+```{r Read in Predictors}
+# if doing for one year
+extracted_df <- read.csv("data/output/csv/working/all_values_test_2016.csv")
+
+# join to basal area at plots
+pv_dataframe <- left_join(spp_biomass_plots, extracted_df, by = "PLOT") #join where we have tree calculations
+pv_dataframe <- pv_dataframe %>%
+  select(-LAT.y, -LON.y, -Field1.x, -Field1.y, -PLOT) %>%
+  rename(y = LAT.x, x = LON.x) 
+
+# remove spp. with little obs. and change NA to 0
+summary(pv_dataframe)
+pv_dataframe <- pv_dataframe %>% 
+  select(-bio.Betula_papyrifera, -bio.Tsuga_mertensiana, -bio.Picea_sitchensis, 
+         -bio.Tsuga_heterophylla, -bio.Pinus_contorta, -bio.Abies_lasiocarpa,         
+         -bio.Chamaecyparis_nootkatensis, -bio.Thuja_plicata, -bio.Alnus_rubra, 
+         -bio.Malus_fusca, -bio.Malus_spp.,-bio.Taxus_brevifolia)
+###### remove NAs from response
+pv_dataframe <- pv_dataframe %>%
+  mutate(across(starts_with("bio."), ~ replace_na(., 0)))
+####### for decid fraction and basal area reclass
+#pv_dataframe <- pv_dataframe %>%
+#  mutate(across(starts_with("Decid_|BA_"), ~ replace_na(., 0)))
+```
+
+## Investigate relationship between response and predictors
+
+```{r Summary Stats}
+# distributions
+hist(pv_dataframe$slope)
+hist(pv_dataframe$nbr_3)
+plot(pv_dataframe$bio.Picea_mariana, pv_dataframe$slope)
+plot(pv_dataframe$bio.Picea_mariana, pv_dataframe$bio.Picea_glauca)
+plot(pv_dataframe$bio.Picea_mariana, pv_dataframe$mndwi_3)
+cor.test(pv_dataframe$bio.Betula_neoalaskana , pv_dataframe$slope)
+cor.test(pv_dataframe$bio.Picea_mariana , pv_dataframe$y) #lat
+cor.test(pv_dataframe$bio.Populus_tremuloides , pv_dataframe$bio.Picea_glauca)
+cor.test(pv_dataframe$bio.Picea_glauca , pv_dataframe$mndwi_2)
+```
+
+## Using Boruta here to eliminate redundant variables. This generates formulas where is each species is the response accompanied by filtered predictors. I am curious if we should use landcover data to stratify our pv dataframe by landcover class in the spirit of improving rf model accuracy. Nonetheless Boruta helps us figure out the mechanisms behind biomass or basal area.
+
+```{r Run Boruta and Obtain Formulas for RF}
+# for all response variables
+#response_vars <- names(pv_dataframe) %>% str_subset("^bio\\.") #sub bio for ba when ready
+response_vars <- names(pv_dataframe) %>% str_subset("^bio\\.")
+class(response_vars)
+boruta_results <- list()
+boruta_formulas <- list()
+boruta_formulas_nonRejected <- list()
+
+for (response in response_vars) {
+  predictors <- setdiff(names(pv_dataframe), response_vars) #rm response vars 
+  formula <- as.formula(paste(response, "~", paste(predictors, collapse = "+")))
+  print(formula)
+  boruta_model <- Boruta(formula, data = pv_dataframe, maxRuns = 400, 
+                         pValue = 0.01, doTrace=2, ntree = 500)
+  attStats(boruta_model)
+  plot(boruta_model, las = 2, cex.axis = 0.7, main = response)
+  
+  boruta_results[[response]] <- boruta_model
+  boruta_formulas[[response]] <- getConfirmedFormula(boruta_model)
+  #boruta_formulas_nonRejected[[response]] <-  getNonRejectedFormula(boruta_model)
+}
+```
+
+## Take outputs from Boruta cleaning and run random forest for each species. Make spatial prediction maps based model results. Output is prediction rasters for each species for each year. Would like to be able to combine the species rasters into one.
+
+```{r Random Forest and Linear Model}
+# define predictors
+predictors_massey <- c("blue_1", "blue_2", "blue_3",  
+                       "green_1", "green_2", "green_3", 
+                       "mndwi_1", "mndwi_2", "mndwi_3", 
+                       "nbr_1", "nbr_2", "nbr_3", 
+                       "ndvi_1", "ndvi_2", "ndvi_3", 
+                       "nir_1", "nir_2", "nir_3", 
+                       "red_1", "red_2", "red_3", 
+                       "savi_1", "savi_2", "savi_3",         
+                       "swir1_1", "swir1_2", "swir1_3", 
+                       "swir2_1", "swir2_2", "swir2_3",       
+                       "slope", "elev", "aspect", 
+                       "vari_1", "vari_2", "vari_3")
+
+# loop through formulas (one per species ~ we could do more per species)
+rf_models <- list()
+rf_TestModels <- list()
+lms <- list()
+lm_summaries <- list()
+rf_comparisons <- list()
+
+for (response in response_vars) {
+  formulaMain <- boruta_formulas[[response]] #filtered formula
+  #Massey formula
+  formulaTest <- as.formula(paste(response, "~", 
+                                  paste(predictors_massey, collapse = "+")))
+  modelMain <- randomForest(formulaMain, data=pv_dataframe)
+  modelTest <- randomForest(formulaTest, data=pv_dataframe)
+  rf_models[[response]] <- modelMain
+  rf_TestModels[[response]] <- modelTest
+  importance_values <- importance(modelMain) #if needed for subsequent plots
+  varImpPlot(modelMain, main = response)
+  varImpPlot(modelTest, main = paste0("Massey vars for ", response))
+  #MDSplot(modelMain, modelMain[[response]], k=2, palette=NULL, pch=20, 
+  #        main = paste0("MDS for", response))
+  
+  main_mse <- mean((modelMain$y - modelMain$predicted)^2)
+  test_mse <- mean((modelTest$y - modelTest$predicted)^2)
+  oob_error_main <- modelMain$mse[which.min(modelMain$mse)]
+  oob_error_test <- modelTest$mse[which.min(modelTest$mse)]
+  
+  rf_comparisons[[response]] <- list(
+    Main_MSE = main_mse,
+    Test_MSE = test_mse,
+    OOB_Error_Main = oob_error_main,
+    OOB_Error_Test = oob_error_test)
+    
+  #compare to lm
+  lm <- lm(formulaMain, data=pv_dataframe)
+  lm_summaries[[response]] <- summary(lm)
+  lms[[response]] <- lm
+}
+```
+
+## Interestingly seeing a linear trend between biomass of black spruce and nbr but this is not a high predictor variable in the random forest.
+
+```{r Read in Cropped Raster with Predictor Vars}
+# read in a cropped composite with all bands used in the model
+predictorStack_small_box <- rast("data/output/raster/fullComposite2016_cropped.tif")
+pv_rast_df <- as.data.frame(predictorStack_small_box, xy = TRUE)
+xrast <- rast(ncol = ncol(predictorStack_small_box), nrow = nrow(predictorStack_small_box), crs = crs(predictorStack_small_box))
+yrast <- rast(ncol = ncol(predictorStack_small_box), nrow = nrow(predictorStack_small_box), crs = crs(predictorStack_small_box))
+values(xrast) <- pv_rast_df$x
+values(yrast) <- pv_rast_df$y
+names(xrast) <- "x"
+names(yrast) <- "y"
+ext(xrast) <- ext(predictorStack_small_box)
+ext(yrast) <- ext(predictorStack_small_box)
+#pv raster stack with x and y as columns
+pv_rast_xy <- c(predictorStack_small_box, xrast, yrast)
+summary(values(pv_rast_xy$blue_1)) #make sure values are there
+```
+
+## Make spatial predictions from model results. This will do it for each response variable
+
+```{r Spatial Predictions}
+# make model results spatial
+predRasters <- list()
+for (i in seq_along(models)) {
+  response_var <- response_vars[i]
+  predRasters[[response_var]] <- predict(pv_rast_xy, models[[response_var]])
+}
+# make sure this stacks outputs for each species
+predRasters <- rast(predRasters)
+names(predRasters)
+#writeRaster(predRasters, "data/output/raster/predRasters_spp_bio_2016_cropped.tif")
+```
+
+```{r Reclassify Rasters and Get Biomass Fraction}
+# reclass into functional groups 
+Conifers <- predRasters$bio.Picea_mariana+predRasters$bio.Picea_glauca #total bio of conifer per cell
+
+#total bio of hardwood
+Hardwoods <- predRasters$bio.Populus_balsamifera+predRasters$bio.Populus_tremuloides+
+             predRasters$bio.Betula_neoalaskana+predRasters$bio.Larix_laricina
+
+# proportion of biomass belonging to each group
+DecidFrac <- Hardwoods / (Conifers + Hardwoods)
+ConifFrac <- Conifers / (Conifers + Hardwoods)
+#plot(values(DecidFrac))
+#plot(values(ConifFrac))
+plot(ConifFrac)
+plot(DecidFrac)
+#writeRaster(DecidFrac, "data/output/raster/decid_frac_2016_test_data.tif")
+#writeRaster(ConifFrac, "data/output/raster/conif_frac_2016_test_data.tif")
+```
+
+## Now that workflow works for running a random forest of predictor variable data from one year. The rest of the workflow is adapted to read in many years of predictor variable csv's.
+
+```{r Iterate Over PV CSVs and Store Pred Var DF}
+# read in extracted predictors from gee
+extracted_dfs <- list.files(pattern = "^PREDICTORS*\\.csv", full.names = TRUE)
+# if iterating
+pv_dfs_all_years <- list()
+for (i in seq_along(extracted_dfs)){
+  extracted_df <- read.csv(extracted_dfs[[i]])
+  pv_dataframe <- left_join(spp_biomass_plots, 
+                            extracted_df, by = "PLOT") #join where we have tree meas.
+  pv_dataframe <- pv_dataframe %>% 
+    select(-LAT.y, -LON.y, -Field1.x, -Field1.y) %>%
+    rename(y = LAT.x, x = LON.x) 
+  pv_dataframe <- pv_dataframe %>% 
+    select(-bio.Betula_papyrifera, -bio.Tsuga_mertensiana, 
+           -bio.Picea_sitchensis, -bio.Tsuga_heterophylla, 
+           -bio.Pinus_contorta, -bio.Abies_lasiocarpa,
+           -bio.Chamaecyparis_nootkatensis,-bio.Thuja_plicata, 
+           -bio.Alnus_rubra, -bio.Malus_fusca, 
+           -bio.Malus_spp.,-bio.Taxus_brevifolia)
+  pv_dataframe <- pv_dataframe %>% 
+    mutate(across(starts_with("bio."), ~ replace_na(., 0)))
+  pv_dfs_all_years[[i]] <- pv_dataframe 
+}
+```
+
+## For each csv in our list of dataframes we run it through Boruta and take the filtered formula and run a random forest. All random forest results are compared to a linear model and to Massey predictor variables.
+
+```{r Iterate Boruta and RF}
+boruta_results_all_years <- list()
+boruta_formulas_all_years <- list()
+rf_models_all_years <- list()
+predRasters_all_years <- list()
+
+# loop over each pv dataframe and run Boruta and Random Forest
+for (year_id in seq_along(pv_dfs_all_years)) {
+  pv_dataframe <- pv_dfs_all_years[[year_id]]
+  
+  #boruta
+  boruta_results <- list()
+  boruta_formulas <- list()
+  response_vars <- names(pv_dataframe) %>% str_subset("^bio\\.")
+  for (response in response_vars) {
+    predictors <- setdiff(names(pv_dataframe), response_vars) #rm response vars
+    formula <- as.formula(paste(response, "~", paste(predictors, collapse = "+")))
+    print(formula)
+    boruta_model <- Boruta(formula, data = pv_dataframe, 
+                           maxRuns = 150, pValue = 0.05, doTrace = 2, ntree=500)
+    boruta_results[[response]] <- boruta_model
+    boruta_formulas[[response]] <- getConfirmedFormula(boruta_model)
+  }
+  boruta_results_all_years[[year_id]] <- boruta_results
+  boruta_formulas_all_years[[year_id]] <- boruta_formulas
+  
+  #random forest with cleaned predictor vars that are response var specific
+  models <- list()
+  for (response_var in response_vars) {
+    # define test formula and main formula filtered formula from boruta
+    formulaMain <- boruta_formulas[[response]] #filtered formula
+    #Massey raw formula
+    formulaTest <- as.formula(paste(response, "~", 
+                                    paste(predictors_massey, collapse = "+")))
+    modelMain <- randomForest(formulaMain, data=pv_dataframe)
+    modelTest <- randomForest(formulaTest, data=pv_dataframe)
+    rf_models[[response]] <- modelMain
+    rf_TestModels[[response]] <- modelTest
+    
+    importance_values <- importance(model) #if needed for subsequent plots
+    varImpPlot(modelMain, main = response)
+    varImpPlot(modelTest, main = paste0("Massey vars for ", response))
+    
+    main_mse <- mean((modelMain$y - modelMain$predicted)^2)
+    test_mse <- mean((modelTest$y - modelTest$predicted)^2)
+    oob_error_main <- modelMain$mse[which.min(modelMain$mse)]
+    oob_error_test <- modelTest$mse[which.min(modelTest$mse)]
+    
+    rf_comparisons[[response]] <- list(
+      Main_MSE = main_mse,
+      Test_MSE = test_mse,
+      OOB_Error_Main = oob_error_main,
+      OOB_Error_Test = oob_error_test)
+        
+    #compare to lm
+    lm <- lm(formulaMain, data=pv_dataframe)
+    lm_summaries[[response]] <- summary(lm)
+    lms[[response]] <- lm
+  }
+  rf_models_all_years[[year_id]] <- models  
+  
+  #spatial prediction chunk here:
+}
+```

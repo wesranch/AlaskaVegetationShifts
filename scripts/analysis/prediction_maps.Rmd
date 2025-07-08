@@ -1,0 +1,96 @@
+---
+title: "Imputing biomass from random forests"
+author: "Wesley Rancher"
+date: "2025-07-07"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r, echo=FALSE}
+#setting up
+library(tidymodels)
+library(randomForest)
+library(terra)
+```
+
+Path to models and rasters
+
+```{r}
+model_files <- list.files("models/", full.names = TRUE)
+
+models <- setNames(
+  lapply(model_files, readRDS),
+  tools::file_path_sans_ext(basename(model_files))
+)
+
+files <- list.files("data/processed/raster/tiles/", full.names = TRUE)
+```
+
+Function to add lat/lon as raster bands and remove/modify existing bands
+
+```{r}
+add_xy_bands <- function (file) {
+  #read in raster / convert to df
+  raster <- rast(file)
+  raster_df <- as.data.frame(raster, xy = TRUE)
+  
+  #empty rasters to populate with actual lat lon
+  xrast <- rast(ncol = ncol(raster), nrow = nrow(raster), crs = crs(raster))
+  yrast <- rast(ncol = ncol(raster), nrow = nrow(raster), crs = crs(raster))
+  values(xrast) <- raster_df$x
+  values(yrast) <- raster_df$y
+  names(xrast) <- "lon"
+  names(yrast) <- "lat"
+  
+  # set ext and add bands
+  ext(xrast) <- ext(raster)
+  ext(yrast) <- ext(raster)
+  full_raster <- c(raster, xrast, yrast)
+  
+  # modify time since fire to binary
+  full_raster$tsf_0_5 <- full_raster$tsf >=0 & full_raster$tsf < 5 
+  full_raster$tsf_5_10 <- full_raster$tsf >=5 & full_raster$tsf < 10 
+  full_raster$tsf_10_15 <- full_raster$tsf >=10 & full_raster$tsf < 15 
+  full_raster$tsf_15_20 <- full_raster$tsf >=15 & full_raster$tsf < 20 
+  
+  #drop some bands
+  layer_names <- names(full_raster)
+  drop_layers <- c("tsf", "total_fires", layer_names[grepl("^severity", layer_names)])
+  full_raster <- full_raster[[!layer_names %in% drop_layers]]
+  
+  return(full_raster)
+}
+```
+
+Loop over the models and predict
+
+```{r}
+#loop over each rf model
+for (spp in names(models)){
+  
+  model <- models[[spp]]
+  
+  #loop over each raster file (mosaic later)
+  for (i in seq_along(files)){
+    file <- files[[i]]
+    
+    #one raster layer for spatial reference
+    r <- add_xy_bands(file)
+    template <- r[[1]]
+    
+    #predict onto raster and update the template with prediction values
+    prediction <- predict(model, as.data.frame(full_raster))
+    prediction_raster <- setValues(template, prediction$.pred)
+    names(prediction_raster) <- ".pred"
+    
+    #save the prediction tile
+    path <- "data/processed/raster/tiles/"
+    pattern <- tools::toTitleCase(strsplit(spp, "_")[[1]][3] %>% 
+                                    paste0(strsplit(spp, "_")[[1]][4]))
+    writeRaster(prediction_raster, paste0(path, "prediction_tile_", pattern, "_", i, ".tif"))
+  }
+}
+```
+
+
