@@ -24,7 +24,9 @@ models <- setNames(
   tools::file_path_sans_ext(basename(model_files))
 )
 
-files <- list.files("data/processed/raster/tiles/", full.names = TRUE)
+#path to tiles in dev env
+files <- list.files("F:/remoteSensing/data/output/gee/tiles/", pattern = "landis-tile-", full.names = TRUE)
+#files <- list.files("data/processed/raster/tiles/", full.names = TRUE)
 ```
 
 Function to add lat/lon as raster bands and remove/modify existing bands
@@ -80,7 +82,7 @@ for (spp in names(models)){
     template <- r[[1]]
     
     #predict onto raster and update the template with prediction values
-    prediction <- predict(model, as.data.frame(full_raster))
+    prediction <- predict(model, as.data.frame(r))
     prediction_raster <- setValues(template, prediction$.pred)
     names(prediction_raster) <- ".pred"
     
@@ -89,6 +91,7 @@ for (spp in names(models)){
     pattern <- tools::toTitleCase(strsplit(spp, "_")[[1]][3] %>% 
                                     paste0(strsplit(spp, "_")[[1]][4]))
     writeRaster(prediction_raster, paste0(path, "prediction_tile_", pattern, "_", i, ".tif"))
+    print(paste0("file written: ", basename(file)))
   }
 }
 ```
