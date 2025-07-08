@@ -1,8 +1,9 @@
 data/*
 !data/.gitkeep
 
-models/*
-!models/.gitkeep
-
 results/*
 !results/.gitkeep
+
+.DS_Store
+.Rhistory
+.Rproj.user/
