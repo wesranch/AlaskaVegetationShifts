@@ -23,11 +23,12 @@ models <- setNames(
   lapply(model_files, readRDS),
   tools::file_path_sans_ext(basename(model_files))
 )
-
+s
 #path to tiles in dev env
 files <- list.files("F:/remoteSensing/data/output/gee/tiles/", pattern = "landis-tile-", full.names = TRUE)
 #files <- list.files("data/processed/raster/tiles/", full.names = TRUE)
-files <- files[!grepl("0000011264-0000000000", files)] #rm empty rasters that earth engine created
+files <- files[!grepl("-2000-", files)]
+files <- files[!grepl("0000005632-002", files)]
 ```
 
 Function to add lat/lon as raster bands and remove/modify existing bands
@@ -66,6 +67,25 @@ add_xy_bands <- function (file) {
 }
 ```
 
+```{r}
+valid_files <- c()
+
+for (f in files) {
+  r <- try(rast(f), silent = TRUE)
+  if (inherits(r, "try-error")) {
+    warning(paste("Skipping corrupt raster:", basename(f)))
+    next
+  }
+  if (ncell(r) == 0 || all(is.na(values(r)))) {
+    warning(paste("Skipping empty or NA raster:", basename(f)))
+    next
+  }
+  valid_files <- c(valid_files, f)
+}
+
+files <- valid_files
+```
+
 Loop over the models and predict
 
 ```{r}
@@ -82,8 +102,15 @@ for (spp in names(models)){
     r <- add_xy_bands(file)
     template <- r[[1]]
     
+    #conditional for GEE tiles outside AOI
+    r_df <- as.data.frame(r)
+    if (nrow(r_df) == 0) {
+      warning(paste("Skipping file (empty raster):", basename(file)))
+      next
+    }
+    
     #predict onto raster and update the template with prediction values
-    prediction <- predict(model, as.data.frame(r))
+    prediction <- predict(model, r_df)
     prediction_raster <- setValues(template, prediction$.pred)
     names(prediction_raster) <- ".pred"
     
