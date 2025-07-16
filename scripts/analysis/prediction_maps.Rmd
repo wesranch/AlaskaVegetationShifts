@@ -23,10 +23,10 @@ models <- setNames(
   lapply(model_files, readRDS),
   tools::file_path_sans_ext(basename(model_files))
 )
+models <- models[!grepl(paste0("final_fit_black_spruce"), names(models))]#remove black spruce for now
 
 #path to tiles in dev env
 files <- list.files("F:/remoteSensing/data/output/gee/tiles/", pattern = "landis-tile-", full.names = TRUE)
-files <- files[!grepl(paste(2000:2007, collapse = "|"), files)]
 #files <- list.files("data/processed/raster/tiles/", full.names = TRUE)
 ```
 
